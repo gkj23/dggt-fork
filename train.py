@@ -113,40 +113,48 @@ def main(args):
             optimizer.zero_grad()
 
             with torch.cuda.amp.autocast(dtype=dtype):
+                # 模型输入images，输出pos_enc,depth,gs_map,gs_conf,dynamic_conf,semantic_logits
                 predictions = model(images)
                 H, W = images.shape[-2:]
+                # pose encoding: B,S,9（平移向量T 旋转四元数 fov）
+                # 内外参,一般这种训练都是Batchsize=1
                 extrinsics, intrinsics = pose_encoding_to_extri_intri(predictions['pose_enc'], (H, W))
                 extrinsic = extrinsics[0]
-                bottom = torch.tensor([0.0, 0.0, 0.0, 1.0], device=extrinsic.device).view(1, 1, 4).expand(extrinsic.shape[0], 1, 4)
+                # 外参最后一行的[0,0,0,1]
+                bottom = torch.tensor([0.0, 0.0, 0.0, 1.0], device=extrinsic.device).view(1, 1, 4).expand(extrinsic.shape[0], 1, 4)  #[B,1,4]
                 extrinsic = torch.cat([extrinsic, bottom], dim=1)
                 intrinsic = intrinsics[0]
 
                 use_depth = True
                 if use_depth:
-                    depth_map = predictions["depth"][0]
+                    depth_map = predictions["depth"][0]   #[B,S,H,W]
                     point_map = unproject_depth_map_to_point_map(depth_map, extrinsics[0], intrinsics[0])[None,...]
-                    point_map = torch.from_numpy(point_map).to(device).float()
+                    point_map = torch.from_numpy(point_map).to(device).float()  #[B,S,H,W,3],每个像素世界坐标
                 else:      
                     point_map = predictions["world_points"]
-                gs_map = predictions["gs_map"]
-                gs_conf = predictions["gs_conf"]
-                dy_map = predictions["dynamic_conf"].squeeze(-1) #B,H,W,1
+                gs_map = predictions["gs_map"]  #[B,S,H,W,11]
+                gs_conf = predictions["gs_conf"]  #[B,S,H,W,1]
+                dy_map = predictions["dynamic_conf"].squeeze(-1) #B,S,H,W,1
                 semantic_logits = predictions["semantic_logits"]  #road, building, car, truck, person, bicycle, sky, vegetation
 
+                # static dynamic separation
+                # 根据dynamic_conf的置信度，给每帧预测的gs_map中每个
                 static_mask = torch.ones_like(bg_mask)
-                static_points = point_map[static_mask].reshape(-1, 3)
-                gs_dynamic_list = dy_map[static_mask].sigmoid() 
+                static_points = point_map[static_mask].reshape(-1, 3) 
+                gs_dynamic_list = dy_map[static_mask].sigmoid()  #[N,1]注意[static_mask]会将所有满足要求的展平
+                # 注意get_split_gs将下面所有都展平成[N,3], [N,1], [N,3], [N,4]这样的了
                 static_rgbs, static_opacity, static_scales, static_rotations = get_split_gs(gs_map, static_mask)
                 static_opacity = static_opacity * (1 - gs_dynamic_list)
                 static_gs_conf = gs_conf[static_mask]
                 frame_idx = torch.nonzero(static_mask, as_tuple=False)[:,1]
-                gs_timestamps = timestamps[frame_idx]     
+                gs_timestamps = timestamps[frame_idx]     # 生成static_points中每个像素点对应的timestamp
 
                 dynamic_points, dynamic_rgbs, dynamic_opacitys, dynamic_scales, dynamic_rotations = [], [], [], [], []
                 for i in range(dy_map.shape[1]):
                     point_map_i = point_map[:, i]
                     bg_mask_i = bg_mask[:, i]
                     dynamic_point = point_map_i[bg_mask_i].reshape(-1, 3)
+                    # 每个要分别找到
                     dynamic_rgb, dynamic_opacity, dynamic_scale, dynamic_rotation = get_split_gs(gs_map[:, i], bg_mask_i)
                     gs_dynamic_list_i = dy_map[:, i][bg_mask_i].sigmoid() 
                     dynamic_opacity = dynamic_opacity * gs_dynamic_list_i
@@ -159,6 +167,7 @@ def main(args):
                 chunked_renders, chunked_alphas = [], []
                 S = extrinsic.shape[0]
                 for idx in range(S):
+                    # t0为对应帧的时间戳
                     t0 = timestamps[idx]
                     static_opacity_ = alpha_t(gs_timestamps, t0, static_opacity, gamma0 = static_gs_conf)
                     static_gs_list = [static_points, static_rgbs, static_opacity_, static_scales, static_rotations]
