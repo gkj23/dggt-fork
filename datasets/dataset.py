@@ -141,6 +141,8 @@ class WaymoOpenDataset(Dataset):
         #mode 1 : train
         #mode 2 : pure reconstruction
         #mode 3 : interplation
+
+        #sequence_length: 每个iteration输入的image数量
         
         self.image_dir = image_dir
         self.sequence_length = sequence_length
@@ -185,10 +187,24 @@ class WaymoOpenDataset(Dataset):
         self.ego_paths = []
 
         self.start_idx = start_idx
-
+        
+        filtered_scene_names = []
         for scene_name in scene_names:
             scene_path = os.path.join(image_dir, scene_name, "images")
             if os.path.isdir(scene_path):
+        #         if self.views == 1:
+        #             image_paths = sorted(
+        #                 [os.path.join(scene_path, f) for f in os.listdir(scene_path) if f.endswith(("_0.jpg", "_0.png"))]
+        #             )
+        #             if len(image_paths) >= 20:
+        #                 filtered_scene_names.append(scene_name)
+        #             else:
+        #                 print(f"{scene_name} Error: images not found")
+        # self.scenes = filtered_scene_names
+
+        # for scene_name in filtered_scene_names:
+        #     scene_path = os.path.join(image_dir, scene_name, "images")
+        #     if os.path.isdir(scene_path):
                 # image
                 if self.views == 1:
                     image_paths = sorted(
@@ -228,6 +244,8 @@ class WaymoOpenDataset(Dataset):
                             views_sky_lists.append(files_v)
                         self.sky_mask_paths.append(views_sky_lists)
                 else:
+                    # 提供了sky_masks没有的情况
+                    print(f"{scene_name} Error: sky_masks not found")
                     self.sky_mask_paths.append([] if self.views == 1 else [[] for _ in range(3)])
 
                 # extrinsic
@@ -264,19 +282,22 @@ class WaymoOpenDataset(Dataset):
                 else:
                     self.intrinsic_paths.append("" if self.views == 1 else ["" for _ in range(3)])
 
-                # dynamic mask
-                dynamic_mask_path = os.path.join(image_dir, scene_name, "fine_dynamic_masks/all")
-                if os.path.isdir(dynamic_mask_path):
+                # dynamic mask在processed里面的组织和与预想的不一样，稍微改动一下
+                # dynamic mask: try "fine_dynamic_masks/all" first, then fallback to "dynamic_masks"
+                # dynamic_mask_dir = os.path.join(image_dir, scene_name, "fine_dynamic_masks/all")
+                # if not os.path.isdir(dynamic_mask_dir):
+                dynamic_mask_dir = os.path.join(image_dir, scene_name, "dynamic_masks")
+                if os.path.isdir(dynamic_mask_dir):
                     if self.views == 1:
                         dynamic_mask_paths = sorted(
-                            [os.path.join(dynamic_mask_path, f) for f in os.listdir(dynamic_mask_path) if f.endswith(("_0.jpg", "_0.png"))]
+                            [os.path.join(dynamic_mask_dir, f) for f in os.listdir(dynamic_mask_dir) if f.endswith(("_0.jpg", "_0.png"))]
                         )
                         self.dynamic_mask_path.append(dynamic_mask_paths)
                     elif self.views == 3:
                         views_dyn_lists = []
                         for v in range(3):
                             suffixes = (f"_{v}.jpg", f"_{v}.png")
-                            files_v = sorted([os.path.join(dynamic_mask_path, f) for f in os.listdir(dynamic_mask_path) if f.endswith(suffixes)])
+                            files_v = sorted([os.path.join(dynamic_mask_dir, f) for f in os.listdir(dynamic_mask_dir) if f.endswith(suffixes)])
                             views_dyn_lists.append(files_v)
                         self.dynamic_mask_path.append(views_dyn_lists)
                 else:
@@ -332,7 +353,8 @@ class WaymoOpenDataset(Dataset):
 
         if self.mode == 1:
             indices = [start_idx]
-            intervals = sorted(random.sample(range(1, 20), self.sequence_length - 1))
+            # print("indices:",indices)
+            intervals = sorted(random.sample(range(1, min(20, len(image_paths)-1-start_idx)), self.sequence_length - 1))
             for interval in intervals:
                 indices.append(start_idx + interval)
 

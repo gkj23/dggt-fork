@@ -1,6 +1,8 @@
 import argparse
 import os
-
+import sys
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(project_root)
 import numpy as np
 
 if __name__ == "__main__":
@@ -29,13 +31,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num_workers",
         type=int,
-        default=4,
+        default=1,
         help="number of threads to be used",
     )
     # priority: scene_ids > start_idx + num_scenes
     parser.add_argument(
         "--scene_ids",
-        default=None,
+        default=[0],
         type=int,
         nargs="+",
         help="scene ids to be processed, a list of integers separated by space. Range: [0, 798] for training, [0, 202] for validation",
@@ -66,7 +68,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--process_keys",
         nargs="+",
-        default=["images", "lidar", "calib", "pose", "ground", "dynamic_masks"],
+        default=["images", "calib", "pose", "dynamic_masks"], #因为报错省略了 "lidar" "ground"
     )
     args = parser.parse_args()
     if args.dataset != "nuscenes" and args.interpolate_N > 0:
@@ -128,7 +130,7 @@ if __name__ == "__main__":
 
     if args.dataset == "waymo":
         from datasets.waymo.waymo_preprocess_ import WaymoProcessor 
-
+        args.overwrite = False
         dataset_processor = WaymoProcessor(
             load_dir=args.data_root,
             save_dir=args.target_dir,

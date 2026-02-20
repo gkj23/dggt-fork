@@ -48,7 +48,10 @@ class VDPM(nn.Module):
         views, autocast_dpt=None
     ):
         images = torch.stack([view["img"] for view in views], dim=1)
-        aggregated_tokens_list, patch_start_idx = self.aggregator(images)
+        # token_list结构：tokens = torch.cat([camera_token, time_conditioning_token, register_token, patch_tokens], dim=1)
+        # patch_start_idx:标识从第几个token开始是真正的patchtoken
+        # aggregated_tokens_list:$$[B, S, P, C]$$tensor的列表
+        aggregated_tokens_list, patch_start_idx = self.aggregator(images) #tokens_list:$$[B, S, N_{tokens}, D]$$
 
         res_dynamic = dict()
 

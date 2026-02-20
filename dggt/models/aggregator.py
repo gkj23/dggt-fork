@@ -227,6 +227,10 @@ class Aggregator(nn.Module):
         register_token = slice_expand_and_flatten(self.register_token, B, S)
 
         # Concatenate special tokens with patch tokens
+        # test
+        print("camera_token:",camera_token.shape)
+        print("register_token:",register_token.shape)
+        print("patch_tokens:",patch_tokens.shape)
         tokens = torch.cat([camera_token, register_token, patch_tokens], dim=1) #B*S, P', C
 
         penultimate_features = self.patch_embed.get_intermediate_layers(images, n=24)

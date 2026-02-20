@@ -4,6 +4,14 @@
 # This source code is licensed under the license found in the
 # LICENSE-VGGT file in the root directory of this source tree.
 
+import os
+import sys
+
+# 将本地 vggt 所在目录加入路径，便于找到 vggt 包（dggt/dpm/vggt）
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+if _this_dir not in sys.path:
+    sys.path.insert(0, _this_dir)
+
 import logging
 import torch
 import torch.nn as nn
@@ -123,6 +131,7 @@ class Aggregator(nn.Module):
 
         # Note: We have two camera tokens, one for the first frame and one for the rest
         # The same applies for register tokens
+        # (1,2,1,D):1表示batch，2表示一个用于首帧一个用于后续帧，1表示token数量，D表示token维数
         self.camera_token = nn.Parameter(torch.randn(1, 2, 1, embed_dim))
         self.register_token = nn.Parameter(torch.randn(1, 2, num_register_tokens, embed_dim))
 
@@ -204,8 +213,8 @@ class Aggregator(nn.Module):
                 The list of outputs from the attention blocks,
                 and the patch_start_idx indicating where patch tokens begin.
         """
-        B, S, C_in, H, W = images.shape
-
+        B, S, C_in, H, W = images.shape  # [1,4,3,250,518] 4是因为sequence_length设定的4帧
+        
         if C_in != 3:
             raise ValueError(f"Expected 3 input channels, got {C_in}")
 
@@ -219,15 +228,33 @@ class Aggregator(nn.Module):
         if isinstance(patch_tokens, dict):
             patch_tokens = patch_tokens["x_norm_patchtokens"]
 
-        _, P, C = patch_tokens.shape
+        _, P, C = patch_tokens.shape  #token的shape：[B*S, P, C]
 
         # Expand camera and register tokens to match batch size and sequence length
+        # camera token初始化成(1,2,1,D)，2用于区分首帧和后续帧
         camera_token = slice_expand_and_flatten(self.camera_token, B, S)
+        # register token初始化成(1,2,4,D)，现代ViT设计，用于吸收噪声
         register_token = slice_expand_and_flatten(self.register_token, B, S)
         # do something similar for time_conditioning_token
+        # time_conditioning_token初始化成(1,1,D),用作之后Decoder的时间token
+        # 相对于DGGT的aggregator新增的！！！
         time_conditioning_token = slice_expand_and_flatten_single(self.time_conditioning_token, B, S)
+        
         # Concatenate special tokens with patch tokens
-        tokens = torch.cat([camera_token, time_conditioning_token, register_token, patch_tokens], dim=1)
+        # test
+        # print("camera_token:",camera_token.shape)[4,1,1024]
+        # print("time_conditioning_token:",time_conditioning_token.shape)[4,1,1024]
+        # print("register_token:",register_token.shape)[4,4,1024]
+        # print("patch_tokens:",patch_tokens.shape)[4,925,1024]
+        # 所以不是一帧一帧的[camera_token, time_conditioning_token, register_token, patch_tokens]
+        # 而是所有帧的camera_token, time_conditioning_token, register_token, patch_tokens分别拼接，再拼接在一起
+        tokens = torch.cat([camera_token, time_conditioning_token, register_token, patch_tokens], dim=1) # [B*S,N_tokens,D]
+
+        penultimate_features = self.patch_embed.get_intermediate_layers(images, n=24)
+        dino_token_list = []
+        for i in range(len(penultimate_features)):
+            dino_tokens = torch.cat([camera_token, time_conditioning_token, register_token, penultimate_features[i]], dim=1).view(B, S, -1, C) #tokens 
+            dino_token_list.append(dino_tokens)
 
         pos = None
         if self.rope is not None:
@@ -246,7 +273,9 @@ class Aggregator(nn.Module):
         frame_idx = 0
         global_idx = 0
         output_list = []
+        image_tokens_list = []
 
+        # 输入token：[B*S, P, C][4,931,1024]
         for _ in range(self.aa_block_num):
             for attn_type in self.aa_order:
                 if attn_type == "frame":
@@ -259,16 +288,27 @@ class Aggregator(nn.Module):
                     )
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
+            # 输出的frame和global的intermediates：[B, S, P, C]
+            # print("frame_intermediates:",len(frame_intermediates))
+            # print("global_intermediates:",len(global_intermediates))
 
             for i in range(len(frame_intermediates)):
+                # print("frame_intermediates[{}]:".format(i),frame_intermediates[i].shape)
+                # print("global_intermediates[{}]:".format(i),global_intermediates[i].shape)
                 # concat frame and global intermediates, [B x S x P x 2C]
-                concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
+                concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)#[B,S,P,2C]
                 output_list.append(concat_inter)
+                
+                concat_inter_with_tokens = torch.cat([dino_token_list[i], frame_intermediates[i], global_intermediates[i]], dim=-1)
+                image_tokens_list.append(concat_inter_with_tokens)
 
         del concat_inter
         del frame_intermediates
         del global_intermediates
-        return output_list, self.patch_start_idx
+        del concat_inter_with_tokens
+        # print("image_tokens_list:",len(image_tokens_list),image_tokens_list[0].shape)
+        # print("output_list:",len(output_list),output_list[0].shape)
+        return output_list, image_tokens_list, self.patch_start_idx
 
     def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
         """
@@ -324,14 +364,13 @@ def slice_expand_and_flatten(token_tensor, B, S):
     1) Uses the first position (index=0) for the first frame only
     2) Uses the second position (index=1) for all remaining frames (S-1 frames)
     3) Expands both to match batch size B
-    4) Concatenates to form (B, S, X, C) where each sequence has 1 first-position token
-       followed by (S-1) second-position tokens
+    4) Concatenates to form (B, S, X, C) where each sequence has 1 first-position token followed by (S-1) second-position tokens
     5) Flattens to (B*S, X, C) for processing
 
     Returns:
         torch.Tensor: Processed tokens with shape (B*S, X, C)
     """
-
+    # token_tensor:[1,2,Num,Dim]
     # Slice out the "query" tokens => shape (1, 1, ...)
     query = token_tensor[:, 0:1, ...].expand(B, 1, *token_tensor.shape[2:])
     # Slice out the "other" tokens => shape (1, S-1, ...)

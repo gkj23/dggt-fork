@@ -91,6 +91,8 @@ def main():
     parser.add_argument('-metrics', action='store_true', help='Whether to output evaluation metrics')
     parser.add_argument('-diffusion', action='store_true', help='Whether to process images with diffusion model')
     parser.add_argument('--intervals', type=int, default=2, help='Interval for mode=3')
+    parser.add_argument('--use_vdpm_backbone', action='store_true', help='Use v-dpm backbone instead of original aggregator')
+    parser.add_argument('--decoder_depth', type=int, default=4, help='Depth of decoder when using v-dpm backbone')
     args = parser.parse_args()
     os.makedirs(args.output_path, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -120,7 +122,17 @@ def main():
         )
     dataloader = DataLoader(dataset, batch_size=1, shuffle=False)
 
-    model = VGGT().to(device)
+    # 创建配置对象（如果需要使用 v-dpm backbone）
+    cfg = None
+    if args.use_vdpm_backbone:
+        class Config:
+            class model:
+                decoder_depth = args.decoder_depth
+        cfg = Config()
+        model = VGGT(use_vdpm_backbone=True, cfg=cfg).to(device)
+    else:
+        model = VGGT().to(device)
+    
     checkpoint = torch.load(args.ckpt_path, map_location="cpu")
     model.load_state_dict(checkpoint, strict=True)
     if args.mode == 3:

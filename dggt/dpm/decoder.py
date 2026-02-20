@@ -285,19 +285,23 @@ class Decoder(nn.Module):
         cond_view_idxs: torch.Tensor
     ):
         # Use tokens from the last block for conditioning
-        tokens_last = aggregated_tokens_list[-1]  # [B S N_tok D]
+        tokens_last = aggregated_tokens_list[-1]  # [24,B,S,P,2C]
         # Extract the camera tokens
         cond_token_idx = 1
-        camera_tokens = tokens_last[:, :, [cond_token_idx]]  # [B S D]
+        # 这里取第一个代表time_condition_token
+        time_condition_tokens = tokens_last[:, :, [cond_token_idx]]  # [B,S,1,D]
 
-        cond_view_idxs = cond_view_idxs.to(camera_tokens.device)
+        cond_view_idxs = cond_view_idxs.to(time_condition_tokens.device)
         cond_view_idxs = repeat(
             cond_view_idxs,
             "b s -> b s c d",
-            c=camera_tokens.shape[2],
-            d=camera_tokens.shape[3],
-        )
-        cond_tokens = torch.gather(camera_tokens, 1, cond_view_idxs)
+            c=time_condition_tokens.shape[2],
+            d=time_condition_tokens.shape[3],
+        ) # 从[B,S]变成[B,S,1,D]
+        # 语法：torch.gather(input, dim, index)：
+        # 在 dim 维上，用 index 里的整数做索引，从 input 里取值
+        cond_tokens = torch.gather(time_condition_tokens, 1, cond_view_idxs)
+        # 给出的是[B,S]每帧用什么condition来decode，因此想要变换decode哪一帧，直接在外面变化cond_view_idxs即可
 
         return cond_tokens
 

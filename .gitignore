@@ -1,0 +1,8 @@
+data/waymo
+data/annotations
+logs/
+drivestudio/
+ply_examples/
+pretrain/
+SegFormer/
+third_party/

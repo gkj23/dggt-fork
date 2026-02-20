@@ -74,6 +74,25 @@ python datasets/preprocess_waymo.py \
     --process_keys images lidar calib pose dynamic_masks ground \
     --json_folder_to_save data/annotations/waymo 
 ```
+
+To preprocess the **first 50 segments** of training (scene index 0–49), use an empty scene list so the script auto-discovers segments under `data_root/training/` in lexicographic order, then pass scene ids 0..49:
+```bash
+# Ensure scene list exists (empty file => auto-discover from data_root/training/)
+mkdir -p data/dataset_scene_list
+touch data/dataset_scene_list/waymo_train_list.txt
+
+python datasets/preprocess_waymo.py \
+    --data_root data/waymo/raw/waymo \
+    --target_dir data/waymo/processed \
+    --dataset waymo \
+    --split training \
+    --scene_list_file data/waymo_train_list.txt \
+    --scene_ids $(seq 0 49) \
+    --num_workers 8 \
+    --process_keys images lidar calib pose dynamic_masks ground \
+    --json_folder_to_save data/annotations/waymo
+```
+Note: Use `--data_root data/waymo/raw/waymo` if your raw tfrecord files are under `data/waymo/raw/waymo/training/` (and similarly for validation).
  
 
 Alternatively, preprocess a batch of scenes by providing the split file:

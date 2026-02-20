@@ -8,12 +8,34 @@ import numpy as np
 import tensorflow as tf
 from PIL import Image
 from tqdm import tqdm, trange
+from waymo_open_dataset.protos import camera_segmentation_pb2 as cs_pb2
 from waymo_open_dataset.utils import frame_utils
 parse_range_image_and_camera_projection = frame_utils.parse_range_image_and_camera_projection
 
 from .visualization import depth_visualizer, scene_flow_to_rgb
 
 from .utils import track_parallel_progress
+
+MOVEABLE_OBJECTS_IDS = [
+    cs_pb2.CameraSegmentation.TYPE_CAR,
+    cs_pb2.CameraSegmentation.TYPE_TRUCK,
+    cs_pb2.CameraSegmentation.TYPE_BUS,
+    cs_pb2.CameraSegmentation.TYPE_OTHER_LARGE_VEHICLE,
+    cs_pb2.CameraSegmentation.TYPE_BICYCLE,
+    cs_pb2.CameraSegmentation.TYPE_MOTORCYCLE,
+    cs_pb2.CameraSegmentation.TYPE_TRAILER,
+    cs_pb2.CameraSegmentation.TYPE_PEDESTRIAN,
+    cs_pb2.CameraSegmentation.TYPE_CYCLIST,
+    cs_pb2.CameraSegmentation.TYPE_MOTORCYCLIST,
+    cs_pb2.CameraSegmentation.TYPE_BIRD,
+    cs_pb2.CameraSegmentation.TYPE_GROUND_ANIMAL,
+    cs_pb2.CameraSegmentation.TYPE_PEDESTRIAN_OBJECT,
+]
+
+WAYMO_CLASSES = ['unknown', 'Vehicle', 'Pedestrian', 'Sign', 'Cyclist']
+WAYMO_DYNAMIC_CLASSES = ['Vehicle', 'Pedestrian', 'Cyclist']
+WAYMO_HUMAN_CLASSES = ['Pedestrian', 'Cyclist']
+WAYMO_VEHICLE_CLASSES = ['Vehicle']
 
 ORIGINAL_SIZE = {
     "0": (1280, 1920),
@@ -379,6 +401,11 @@ def convert_range_image_to_point_cloud_flow(
         range_image_top_pose_tensor_rotation, range_image_top_pose_tensor_translation
     )
     for c in calibrations:
+        # 仅处理本 frame 中实际有数据的 laser（frame.lasers），跳过仅有 calibration 无数据的 laser
+        if c.name not in range_images_flow or c.name not in range_images:
+            continue
+        if ri_index >= len(range_images_flow[c.name]) or ri_index >= len(range_images[c.name]):
+            continue
         range_image = range_images[c.name][ri_index]
         range_image_flow = range_images_flow[c.name][ri_index]
         if len(c.beam_inclinations) == 0:  # pylint: disable=g-explicit-length-test
@@ -505,9 +532,11 @@ class WaymoProcessor:
         Args:
             file_id (int): Index of the file to be converted.
         """
+        # print("using convert_one")
         scene_id = self.scene_ids[file_id]
         scene_name = self.scene_names[file_id]
         tfrecord_path = f"{self.load_dir}/{scene_name}.tfrecord"
+        # print("download path",tfrecord_path)
         dataset = tf.data.TFRecordDataset(tfrecord_path, compression_type="")
         num_frames = sum(1 for _ in dataset)
 
@@ -518,10 +547,14 @@ class WaymoProcessor:
             # frame.ParseFromString(bytearray(data.numpy()))
             frame.ParseFromString(data.numpy())
             if "images" in self.process_keys:
+                # print("save image")
                 self.save_image(frame, file_id, frame_id)
             if "calib" in self.process_keys:
+                # calib:calibration,传感器标定参数
+                # print("save calib")
                 self.save_calib(frame, file_id, frame_id)
             if "pose" in self.process_keys:
+                # print("save pose")
                 self.save_pose(frame, file_id, frame_id)
             if "lidar" in self.process_keys and "depth" not in self.process_keys:
                 self.save_lidar(frame, file_id, frame_id)
@@ -530,7 +563,19 @@ class WaymoProcessor:
             if "dynamic_masks" in self.process_keys:
                 self.save_dynamic_mask(frame, file_id, frame_id)
             if "ground" in self.process_keys:
+                # 行驶地面信息
                 self.save_ground(frame, file_id, frame_id)
+            if "objects" in self.process_keys:
+                self.save_objects(frame, file_id, frame_id)
+        if "objects" in self.process_keys:
+            instances_info, frame_instances = self.save_objects(dataset)
+            
+            # Save instances info and frame instances
+            object_info_dir = f"{self.save_dir}/{str(file_id).zfill(3)}/instances"
+            with open(f"{object_info_dir}/instances_info.json", "w") as fp:
+                json.dump(instances_info, fp, indent=4)
+            with open(f"{object_info_dir}/frame_instances.json", "w") as fp:
+                json.dump(frame_instances, fp, indent=4)
         self.make_json(file_id)
 
     def make_json(self, file_id):
@@ -722,6 +767,9 @@ class WaymoProcessor:
                 range_image_top_pose,
                 ri_index=0,
             )
+            # 若本帧没有任何 laser 通过过滤（如无 flow 数据），则跳过该帧不写 lidar
+            if len(origins) == 0 or len(points) == 0:
+                return
             origins = np.concatenate(origins, axis=0)
             points = np.concatenate(points, axis=0)
             #  -1: no-flow-label, the point has no flow information.
@@ -832,6 +880,9 @@ class WaymoProcessor:
         scene_id = self.scene_ids[file_id]
         scene_path = f"{self.save_dir}/{str(scene_id).zfill(3)}"
         pc_path = f"{scene_path}/lidar/{str(frame_id).zfill(3)}.bin"
+        if not os.path.exists(pc_path):
+            # 该帧在 save_lidar 中因无有效点云/flow 未生成 .bin，跳过 ground 标注
+            return
         point_cloud = np.fromfile(pc_path, dtype=np.float32).reshape(-1, 10)
 
         for cam_id in range(5):
@@ -1011,6 +1062,88 @@ class WaymoProcessor:
             )
             dynamic_mask.save(dynamic_mask_path)
 
+    def save_objects(self, dataset):
+        """Parse and save the ground truth bounding boxes."""
+        instances_info, frame_instances = {}, {}
+        
+        for frame_idx, data in enumerate(dataset):
+            frame = dataset_pb2.Frame()
+            frame.ParseFromString(bytearray(data.numpy()))
+            
+            frame_instances[frame_idx] = []
+            for l in frame.laser_labels:
+                frame_pose = np.array(frame.pose.transform).reshape(4, 4)
+                
+                str_id = str(l.id)
+                if WAYMO_CLASSES[l.type] not in WAYMO_DYNAMIC_CLASSES:
+                    continue
+                
+                frame_instances[frame_idx].append(str_id)
+                
+                if str_id not in instances_info:
+                    instances_info[str_id] = dict(
+                        id=l.id,
+                        # class_ind=l.type,
+                        class_name=WAYMO_CLASSES[l.type],
+                        frame_annotations={
+                            "frame_idx": [],
+                            "obj_to_world": [],
+                            "box_size": [],
+                        }
+                    )
+                
+                # https://github.com/waymo-research/waymo-open-dataset/blob/master/waymo_open_dataset/label.proto
+                box = l.box
+                
+                # Box coordinates in vehicle frame.
+                tx, ty, tz = box.center_x, box.center_y, box.center_z
+                
+                # The heading of the bounding box (in radians).  The heading is the angle
+                #   required to rotate +x to the surface normal of the box front face. It is
+                #   normalized to [-pi, pi).
+                c = np.math.cos(box.heading)
+                s = np.math.sin(box.heading)
+                
+                # [object to vehicle]
+                # https://github.com/gdlg/simple-waymo-open-dataset-reader/blob/d488196b3ded6574c32fad391467863b948dfd8e/simple_waymo_open_dataset_reader/utils.py#L32
+                o2v = np.array([
+                    [ c, -s,  0, tx],
+                    [ s,  c,  0, ty],
+                    [ 0,  0,  1, tz],
+                    [ 0,  0,  0,  1]])
+                
+                # [object to ENU world]
+                pose = frame_pose @ o2v # o2w = v2w @ o2v
+                
+                # difficulty = l.detection_difficulty_level
+                
+                # tracking_difficulty = l.tracking_difficulty_level
+                
+                # Dimensions of the box. length: dim x. width: dim y. height: dim z.
+                # length: dim_x: along heading; dim_y: verticle to heading; dim_z: verticle up
+                dimension = [box.length, box.width, box.height]
+                
+                instances_info[str_id]['frame_annotations']['frame_idx'].append(frame_idx)
+                instances_info[str_id]['frame_annotations']['obj_to_world'].append(pose.tolist())
+                instances_info[str_id]['frame_annotations']['box_size'].append(dimension)
+                
+        # Correct ID mapping
+        id_map = {}
+        for i, (k, v) in enumerate(instances_info.items()):
+            id_map[v["id"]] = i
+
+        # Update keys in instances_info
+        new_instances_info = {}
+        for k, v in instances_info.items():
+            new_instances_info[id_map[v["id"]]] = v
+
+        # Update keys in frame_instances
+        new_frame_instances = {}
+        for k, v in frame_instances.items():
+            new_frame_instances[k] = [id_map[i] for i in v]
+
+        return new_instances_info, new_frame_instances
+
     def create_folder(self):
         """Create folder for data preprocessing."""
         for i in self.scene_ids:
@@ -1026,3 +1159,5 @@ class WaymoProcessor:
             os.makedirs(f"{scene_path}/extrinsics", exist_ok=True)
             os.makedirs(f"{scene_path}/intrinsics", exist_ok=True)
             os.makedirs(f"{scene_path}/lidar", exist_ok=True)
+            if "objects" in self.process_keys:
+                os.makedirs(f"{scene_path}/instances", exist_ok=True)
